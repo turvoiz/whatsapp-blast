@@ -1,0 +1,11 @@
+node_modules/
+auth_info_baileys/
+.wwebjs_auth/
+.wwebjs_cache/
+.env
+.env.*
+*.log
+.DS_Store
+
+# Grosenia-specific integration docs — kept locally, not pushed to standalone repo
+README.grosenia.md

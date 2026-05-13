@@ -1,0 +1,20 @@
+{
+  "name": "grosenia-wa-blast-server",
+  "version": "0.2.0",
+  "description": "WhatsApp blast backend untuk Grosenia Admin Web (pakai Baileys — tanpa Chromium, bukan Meta Business API)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch-path=src src/server.js"
+  },
+  "dependencies": {
+    "@google-cloud/storage": "^7.19.0",
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}
