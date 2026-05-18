@@ -86,7 +86,7 @@ app.get('/api/wa/status', (_req, res) => {
 
 app.post('/api/wa/connect', async (_req, res) => {
   try {
-    await wa.initClient();
+    await wa.connectFresh();
     res.json({ ok: true, ...wa.getStatus() });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -264,7 +264,6 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, HOST, () => {
   console.log('='.repeat(60));
-  console.log('  Grosenia WA Blast Server');
   console.log(`  Listening:        http://${HOST}:${PORT}`);
   console.log(`  Auth dir:         ${config.wa.authDir}`);
   console.log(`  CORS origin:      ${config.server.corsOrigin}`);
