@@ -83,6 +83,46 @@ function renderTemplate(template, data) {
   });
 }
 
+function clearAuthDir() {
+  try {
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+  } catch (_) {}
+}
+
+function destroySocket() {
+  if (!sock) return;
+  try {
+    sock.end?.(undefined);
+  } catch (_) {}
+  sock = null;
+}
+
+/** Setelah logout (HP atau API), buat sesi baru + QR otomatis. */
+function scheduleFreshPairing(delayMs = 500) {
+  if (reconnecting) return;
+  reconnecting = true;
+  setTimeout(async () => {
+    reconnecting = false;
+    try {
+      await connectFresh();
+    } catch (err) {
+      console.error('[wa] Fresh pairing failed:', err.message);
+      state.lastError = err.message;
+      state.status = 'disconnected';
+    }
+  }, delayMs);
+}
+
+/** Paksa socket baru — dipakai POST /connect & setelah unlink dari HP. */
+async function connectFresh() {
+  destroySocket();
+  state.qrDataUrl = null;
+  state.qrRawString = null;
+  state.lastError = null;
+  await initClient();
+}
+
 async function initClient() {
   if (sock) {
     return;
@@ -166,10 +206,8 @@ async function initClient() {
 
       if (statusCode === DisconnectReason.loggedOut) {
         state.status = 'disconnected';
-        try {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-          fs.mkdirSync(AUTH_DIR, { recursive: true });
-        } catch (_) {}
+        clearAuthDir();
+        scheduleFreshPairing();
         return;
       }
 
@@ -487,6 +525,7 @@ function clearJobs({ all = false } = {}) {
 
 module.exports = {
   initClient,
+  connectFresh,
   logout,
   sendBlast,
   cancelJob,
