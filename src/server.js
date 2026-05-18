@@ -102,6 +102,15 @@ app.post('/api/wa/logout', async (_req, res) => {
   }
 });
 
+app.post('/api/wa/reset-session', async (_req, res) => {
+  try {
+    await wa.resetSession();
+    res.json({ ok: true, ...wa.getStatus() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/wa/blast', async (req, res) => {
   try {
     const { recipients, defaultMessage, rateLimit, delayMs } = req.body || {};
@@ -281,6 +290,7 @@ app.listen(PORT, HOST, () => {
   console.log('  GET    /api/wa/status');
   console.log('  POST   /api/wa/connect');
   console.log('  POST   /api/wa/logout');
+  console.log('  POST   /api/wa/reset-session');
   console.log('  POST   /api/wa/blast              body: { recipients, defaultMessage, rateLimit?: {...} }');
   console.log('  GET    /api/wa/rate-limit-defaults');
   console.log('  GET    /api/wa/jobs');
@@ -292,10 +302,12 @@ app.listen(PORT, HOST, () => {
   console.log('  POST   /api/wa/import-sheet       body: { sheetId, gid?, nameCol?, phoneCol?, messageCol?, hasHeader? }');
   console.log('='.repeat(60));
 
+  wa.startIdleMonitor();
+
   if (config.wa.autoConnect) {
     console.log('[startup] Auto-connect WA client...');
     wa.initClient().catch((err) => console.error('[startup] initClient error:', err));
   } else {
-    console.log('[startup] Auto-connect disabled (WA_BLAST_AUTOCONNECT=false). Trigger via POST /api/wa/connect.');
+    console.log('[startup] Auto-connect OFF — pairing manual via POST /api/wa/connect (tombol admin).');
   }
 });
