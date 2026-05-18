@@ -64,12 +64,19 @@ const config = {
   wa: {
     /** path folder utk simpan session keys (auth_info_baileys) */
     authDir: envStr('WA_AUTH_DIR', path.resolve(__dirname, '..', 'auth_info_baileys')),
-    /** auto-connect saat startup (false = tunggu manual POST /connect) */
-    autoConnect: envBool('WA_BLAST_AUTOCONNECT', true),
-    /** browser fingerprint utk Baileys ([name, client, version]) */
-    browserName: envStr('WA_BROWSER_NAME', 'Grosenia Admin'),
+    /** auto-connect saat startup (false = manual via tombol / POST /connect) */
+    autoConnect: envBool('WA_BLAST_AUTOCONNECT', false),
+    /** browser fingerprint — jangan pakai nama custom, WA sering tolak (→ Connection Failure 401) */
+    browserName: envStr('WA_BROWSER_NAME', ''),
     browserClient: envStr('WA_BROWSER_CLIENT', 'Chrome'),
-    browserVersion: envStr('WA_BROWSER_VERSION', '1.0.0'),
+    browserVersion: envStr('WA_BROWSER_VERSION', '22.04.4'),
+    /** pin WA Web version, format: "2,3000,1035194821" — kosong = fetch latest */
+    webVersion: (() => {
+      const raw = envStr('WA_WEB_VERSION', '');
+      if (!raw) return null;
+      const parts = raw.split(',').map((s) => parseInt(s.trim(), 10));
+      return parts.length === 3 && parts.every((n) => Number.isFinite(n)) ? parts : null;
+    })(),
     /** timeout connect awal (ms) */
     connectTimeoutMs: envInt('WA_CONNECT_TIMEOUT_MS', 60_000),
     /** interval keepalive ping (ms) — kalau idle terlalu lama WA disconnect */
@@ -82,6 +89,20 @@ const config = {
     syncFullHistory: envBool('WA_SYNC_FULL_HISTORY', false),
     /** tandai online ke kontak saat connect (false = stealth, kontak gak tau kita online) */
     markOnlineOnConnect: envBool('WA_MARK_ONLINE_ON_CONNECT', false),
+    /** cetak QR ASCII di terminal (dev). Production default false. */
+    printQrInTerminal: envBool(
+      'WA_PRINT_QR_TERMINAL',
+      process.env.NODE_ENV !== 'production',
+    ),
+    /** auto-logout kalau idle (tanpa job running) */
+    idleDisconnect: {
+      enabled: envBool('WA_IDLE_DISCONNECT_ENABLED', true),
+      checkIntervalMs: envInt('WA_IDLE_CHECK_INTERVAL_MS', 15 * 60 * 1000),
+      /** setelah blast selesai / tidak ada aktivitas, logout setelah N jam (default 24 jam) */
+      afterBlastIdleHours: envInt('WA_IDLE_AFTER_BLAST_HOURS', 24),
+      /** maksimal tetap connect tanpa aktivitas (0 = nonaktifkan, hanya pakai afterBlastIdleHours) */
+      maxConnectedDays: envInt('WA_MAX_CONNECTED_DAYS', 4),
+    },
   },
 
   // ─── Jobs / History ──────────────────────────────────────
