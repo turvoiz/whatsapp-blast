@@ -10,6 +10,8 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  Browsers,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const QRCode = require('qrcode');
@@ -27,17 +29,48 @@ const logger = pino({
 });
 
 const state = {
-  status: 'initializing',
+  status: 'disconnected',
   qrDataUrl: null,
   qrRawString: null,
   lastError: null,
   connectedSince: null,
   selfNumber: null,
   jobs: [],
+  lastActivityAt: null,
+  lastIdleLogoutAt: null,
 };
 
 let sock = null;
 let reconnecting = false;
+let pairingWatchdog = null;
+let pairingFailCount = 0;
+let idleMonitorTimer = null;
+
+const PAIRING_TIMEOUT_MS = 60_000;
+const MAX_PAIRING_FAILS = 5;
+
+function hasActiveJobs() {
+  return state.jobs.some((j) => j.status === 'running');
+}
+
+function touchActivity() {
+  state.lastActivityAt = new Date().toISOString();
+}
+
+function getIdleDisconnectAt() {
+  const idle = config.wa.idleDisconnect;
+  if (!idle.enabled || state.status !== 'connected' || !state.lastActivityAt) {
+    return null;
+  }
+  const last = new Date(state.lastActivityAt).getTime();
+  const afterBlastMs = idle.afterBlastIdleHours * 3_600_000;
+  let at = last + afterBlastMs;
+  if (idle.maxConnectedDays > 0) {
+    const maxMs = idle.maxConnectedDays * 24 * 3_600_000;
+    at = Math.min(at, last + maxMs);
+  }
+  return new Date(at).toISOString();
+}
 
 function getStatus() {
   return {
@@ -47,6 +80,14 @@ function getStatus() {
     connectedSince: state.connectedSince,
     selfNumber: state.selfNumber,
     jobsCount: state.jobs.length,
+    hasActiveJobs: hasActiveJobs(),
+    autoConnect: config.wa.autoConnect,
+    lastActivityAt: state.lastActivityAt,
+    idleDisconnectAt: getIdleDisconnectAt(),
+    idlePolicy: {
+      afterBlastIdleHours: config.wa.idleDisconnect.afterBlastIdleHours,
+      maxConnectedDays: config.wa.idleDisconnect.maxConnectedDays,
+    },
   };
 }
 
@@ -98,27 +139,158 @@ function destroySocket() {
   sock = null;
 }
 
-/** Setelah logout (HP atau API), buat sesi baru + QR otomatis. */
-function scheduleFreshPairing(delayMs = 500) {
+function clearPairingWatchdog() {
+  if (pairingWatchdog) {
+    clearTimeout(pairingWatchdog);
+    pairingWatchdog = null;
+  }
+}
+
+/** Kalau stuck di authenticating tanpa QR, hapus sesi & coba pairing ulang. */
+function armPairingWatchdog() {
+  clearPairingWatchdog();
+  pairingWatchdog = setTimeout(async () => {
+    pairingWatchdog = null;
+    if (state.status === 'connected' || state.status === 'qr_required' || state.qrDataUrl) {
+      return;
+    }
+    if (state.status !== 'authenticating' && state.status !== 'initializing') {
+      return;
+    }
+    console.warn('[wa] Pairing timeout — tidak ada QR, hapus sesi & coba ulang');
+    state.lastError = 'Timeout menunggu QR — sesi di-reset otomatis';
+    clearAuthDir();
+    destroySocket();
+    reconnecting = false;
+    try {
+      await connectFresh();
+    } catch (err) {
+      console.error('[wa] Pairing retry failed:', err.message);
+      state.status = 'disconnected';
+      state.lastError = err.message;
+    }
+  }, PAIRING_TIMEOUT_MS);
+}
+
+function isRegisteredSession(authState) {
+  return !!(authState?.creds?.registered && authState?.creds?.me?.id);
+}
+
+async function loadAuthState() {
+  const loaded = await useMultiFileAuthState(AUTH_DIR);
+  if (loaded.state?.creds?.registered && !loaded.state?.creds?.me?.id) {
+    console.warn('[wa] Auth korup (registered tanpa me) — hapus folder sesi');
+    clearAuthDir();
+    return useMultiFileAuthState(AUTH_DIR);
+  }
+  return loaded;
+}
+
+function getBrowserFingerprint() {
+  const { browserName, browserClient, browserVersion } = config.wa;
+  // Fingerprint custom (mis. "Grosenia Admin") sering ditolak WA → Connection Failure 401
+  if (!browserName || browserName === 'Grosenia Admin') {
+    return Browsers.ubuntu('Chrome');
+  }
+  return [browserName, browserClient, browserVersion];
+}
+
+async function fetchBaileysVersion() {
+  if (config.wa.webVersion && config.wa.webVersion.length === 3) {
+    console.log(`[wa] Pakai WA Web version pinned: ${config.wa.webVersion.join('.')}`);
+    return { version: config.wa.webVersion, isLatest: false };
+  }
+  try {
+    const result = await Promise.race([
+      fetchLatestBaileysVersion(),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('fetchLatestBaileysVersion timeout')), 15_000);
+      }),
+    ]);
+    return result;
+  } catch (err) {
+    console.warn(`[wa] Gagal fetch WA version (${err.message}), pakai default dari Baileys`);
+    return { version: undefined, isLatest: false };
+  }
+}
+
+function classifyDisconnect(statusCode, reason, hadRegisteredSession) {
+  const reasonText = String(reason || '');
+  const reasonLower = reasonText.toLowerCase();
+
+  // CB:failure → Boom("Connection Failure", { statusCode: attrs.reason }) — BUKAN logout user
+  if (reasonLower.includes('connection failure')) {
+    return { kind: 'connection_failure' };
+  }
+
+  if (statusCode === DisconnectReason.loggedOut && hadRegisteredSession) {
+    return { kind: 'logged_out' };
+  }
+
+  if (statusCode === DisconnectReason.restartRequired) {
+    return { kind: 'restart_required' };
+  }
+
+  if (
+    statusCode === DisconnectReason.badSession ||
+    statusCode === DisconnectReason.forbidden ||
+    reasonLower.includes('conflict')
+  ) {
+    return { kind: 'bad_session' };
+  }
+
+  return {
+    kind: 'other',
+    shouldReconnect: statusCode !== DisconnectReason.loggedOut,
+  };
+}
+
+function scheduleRetry(delayMs, fn) {
   if (reconnecting) return;
   reconnecting = true;
   setTimeout(async () => {
     reconnecting = false;
     try {
-      await connectFresh();
+      await fn();
     } catch (err) {
-      console.error('[wa] Fresh pairing failed:', err.message);
+      console.error('[wa] Retry failed:', err.message);
       state.lastError = err.message;
       state.status = 'disconnected';
     }
   }, delayMs);
 }
 
+/** Setelah logout (HP atau API), buat sesi baru + QR otomatis (hanya jika autoConnect). */
+function scheduleFreshPairing(delayMs = 3000) {
+  if (!config.wa.autoConnect) return;
+  scheduleRetry(delayMs, () => connectFresh());
+}
+
 /** Paksa socket baru — dipakai POST /connect & setelah unlink dari HP. */
 async function connectFresh() {
+  clearPairingWatchdog();
   destroySocket();
+  reconnecting = false;
+  pairingFailCount = 0;
   state.qrDataUrl = null;
   state.qrRawString = null;
+  state.lastError = null;
+  touchActivity();
+  await initClient();
+}
+
+/** Hapus volume/session + mulai pairing dari nol (sama seperti make wa-blast-reset-session). */
+async function resetSession() {
+  clearPairingWatchdog();
+  destroySocket();
+  reconnecting = false;
+  pairingFailCount = 0;
+  clearAuthDir();
+  state.status = 'disconnected';
+  state.qrDataUrl = null;
+  state.qrRawString = null;
+  state.connectedSince = null;
+  state.selfNumber = null;
   state.lastError = null;
   await initClient();
 }
@@ -135,16 +307,27 @@ async function initClient() {
     fs.mkdirSync(AUTH_DIR, { recursive: true });
   }
 
-  const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version, isLatest } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined, isLatest: false }));
+  const { state: authState, saveCreds } = await loadAuthState();
+  const registered = isRegisteredSession(authState);
+  console.log(`[wa] Auth dir=${AUTH_DIR} registered=${registered}`);
+
+  const { version, isLatest } = await fetchBaileysVersion();
+  const browser = getBrowserFingerprint();
   console.log(`[wa] Baileys WA Web version: ${version ? version.join('.') : 'default'} (isLatest=${isLatest})`);
+  console.log(`[wa] Browser fingerprint: ${browser.join(' / ')}`);
+
+  const signalKeyStore = makeCacheableSignalKeyStore(authState.keys, logger);
+  const hadRegisteredSession = registered;
 
   sock = makeWASocket({
     version,
-    auth: authState,
+    auth: {
+      creds: authState.creds,
+      keys: signalKeyStore,
+    },
     logger,
-    printQRInTerminal: false,
-    browser: [config.wa.browserName, config.wa.browserClient, config.wa.browserVersion],
+    printQRInTerminal: config.wa.printQrInTerminal,
+    browser,
     syncFullHistory: config.wa.syncFullHistory,
     markOnlineOnConnect: config.wa.markOnlineOnConnect,
     // Default-nya 60s utk init queries (fetchProps, dll). Error "Timed Out"
@@ -164,6 +347,8 @@ async function initClient() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      clearPairingWatchdog();
+      pairingFailCount = 0;
       state.qrRawString = qr;
       try {
         state.qrDataUrl = await QRCode.toDataURL(qr, { margin: 1, scale: 6 });
@@ -175,14 +360,18 @@ async function initClient() {
     }
 
     if (connection === 'connecting') {
-      if (state.status !== 'qr_required') {
+      if (!state.qrDataUrl && state.status !== 'qr_required') {
         state.status = 'authenticating';
+        armPairingWatchdog();
       }
       console.log('[wa] Connecting...');
     }
 
     if (connection === 'open') {
+      clearPairingWatchdog();
+      pairingFailCount = 0;
       state.status = 'connected';
+      touchActivity();
       state.connectedSince = new Date().toISOString();
       state.qrDataUrl = null;
       state.qrRawString = null;
@@ -192,68 +381,154 @@ async function initClient() {
     }
 
     if (connection === 'close') {
+      clearPairingWatchdog();
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const reason = lastDisconnect?.error?.message || 'closed';
+      const disconnectAttrs = lastDisconnect?.error?.data || null;
       state.connectedSince = null;
       state.selfNumber = null;
+      state.qrDataUrl = null;
+      state.qrRawString = null;
 
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      state.lastError = reason;
+      const kind = classifyDisconnect(statusCode, reason, hadRegisteredSession);
+      console.warn(
+        `[wa] Connection closed (code=${statusCode}) reason=${reason} kind=${kind.kind}` +
+          (disconnectAttrs ? ` attrs=${JSON.stringify(disconnectAttrs)}` : ''),
+      );
 
-      console.warn(`[wa] Connection closed (code=${statusCode}) reason=${reason} reconnect=${shouldReconnect}`);
+      destroySocket();
+      state.status = 'disconnected';
 
-      sock = null;
+      if (kind.kind === 'connection_failure') {
+        pairingFailCount += 1;
+        state.lastError =
+          'WhatsApp menolak koneksi (Connection Failure). ' +
+          'Pastikan IP server tidak diblokir WA, lalu klik Hubungkan WA. ' +
+          `Percobaan ${pairingFailCount}/${MAX_PAIRING_FAILS}.`;
 
-      if (statusCode === DisconnectReason.loggedOut) {
-        state.status = 'disconnected';
-        clearAuthDir();
-        scheduleFreshPairing();
+        if (!config.wa.autoConnect || pairingFailCount >= MAX_PAIRING_FAILS) {
+          console.error(
+            '[wa] Stop auto-retry — gunakan tombol Tampilkan QR / POST /api/wa/connect.',
+          );
+          return;
+        }
+
+        const delay = Math.min(60_000, 10_000 * pairingFailCount);
+        console.log(`[wa] Retry pairing dalam ${delay / 1000}s...`);
+        scheduleRetry(delay, () => connectFresh());
         return;
       }
 
-      state.status = 'disconnected';
-      if (shouldReconnect && !reconnecting) {
-        reconnecting = true;
-        setTimeout(async () => {
-          reconnecting = false;
-          try {
-            await initClient();
-          } catch (err) {
-            console.error('[wa] Reconnect failed:', err.message);
-          }
-        }, config.wa.reconnectDelayMs);
+      if (kind.kind === 'logged_out') {
+        pairingFailCount = 0;
+        state.lastError = reason;
+        clearAuthDir();
+        scheduleFreshPairing(3000);
+        return;
+      }
+
+      if (kind.kind === 'bad_session') {
+        pairingFailCount = 0;
+        state.lastError = reason;
+        clearAuthDir();
+        scheduleFreshPairing(5000);
+        return;
+      }
+
+      if (kind.kind === 'restart_required') {
+        pairingFailCount = 0;
+        state.lastError = null;
+        scheduleRetry(config.wa.reconnectDelayMs, () => connectFresh());
+        return;
+      }
+
+      state.lastError = reason;
+      if (kind.shouldReconnect) {
+        scheduleRetry(config.wa.reconnectDelayMs, () => initClient());
       }
     }
   });
+
+  if (!registered) {
+    armPairingWatchdog();
+  }
 }
 
-async function logout() {
-  if (!sock) {
-    state.status = 'disconnected';
-    state.qrDataUrl = null;
-    return { ok: true };
-  }
-  try {
-    await sock.logout();
-  } catch (err) {
-    console.error('[wa] Logout error:', err.message);
-  }
-  try {
-    sock.end?.(undefined);
-  } catch (_) {}
-  sock = null;
+async function logout(opts = {}) {
+  const { schedulePairing = config.wa.autoConnect, reason = null, clearSession = true } = opts;
 
-  try {
-    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-    fs.mkdirSync(AUTH_DIR, { recursive: true });
-  } catch (_) {}
+  clearPairingWatchdog();
+  if (sock) {
+    try {
+      await sock.logout();
+    } catch (err) {
+      console.error('[wa] Logout error:', err.message);
+    }
+  }
+  destroySocket();
+  if (clearSession) {
+    clearAuthDir();
+  }
 
   state.status = 'disconnected';
   state.qrDataUrl = null;
   state.qrRawString = null;
   state.connectedSince = null;
   state.selfNumber = null;
+  state.lastError = reason;
+  state.lastActivityAt = null;
+
+  if (schedulePairing) {
+    scheduleFreshPairing();
+  }
   return { ok: true };
+}
+
+async function checkIdleDisconnect() {
+  const idle = config.wa.idleDisconnect;
+  if (!idle.enabled || state.status !== 'connected' || !state.lastActivityAt) {
+    return;
+  }
+  if (hasActiveJobs()) {
+    touchActivity();
+    return;
+  }
+
+  const idleMs = Date.now() - new Date(state.lastActivityAt).getTime();
+  const afterBlastMs = idle.afterBlastIdleHours * 3_600_000;
+  const maxMs =
+    idle.maxConnectedDays > 0 ? idle.maxConnectedDays * 24 * 3_600_000 : Number.POSITIVE_INFINITY;
+
+  let reason = null;
+  if (idle.maxConnectedDays > 0 && idleMs >= maxMs) {
+    reason =
+      `Sesi otomatis logout: tidak ada aktivitas selama ${idle.maxConnectedDays} hari. ` +
+      'Scan QR lagi untuk menghubungkan.';
+  } else if (idleMs >= afterBlastMs) {
+    reason =
+      `Sesi otomatis logout: idle ${idle.afterBlastIdleHours} jam setelah blast selesai / tanpa aktivitas. ` +
+      'Scan QR lagi untuk menghubungkan.';
+  }
+
+  if (reason) {
+    console.log(`[wa] ${reason}`);
+    state.lastIdleLogoutAt = new Date().toISOString();
+    await logout({ schedulePairing: false, reason, clearSession: true });
+  }
+}
+
+function startIdleMonitor() {
+  const idle = config.wa.idleDisconnect;
+  if (!idle.enabled || idleMonitorTimer) return;
+  idleMonitorTimer = setInterval(() => {
+    checkIdleDisconnect().catch((err) => {
+      console.error('[wa] Idle disconnect check failed:', err.message);
+    });
+  }, idle.checkIntervalMs);
+  console.log(
+    `[wa] Idle monitor aktif: logout setelah ${idle.afterBlastIdleHours}j tanpa job aktif, ` +
+      `atau ${idle.maxConnectedDays} hari tanpa aktivitas`,
+  );
 }
 
 /**
@@ -376,6 +651,7 @@ async function sendBlast({ recipients, defaultMessage, rateLimit, delayMs }) {
     results: [],
   };
   pushJob(job);
+  touchActivity();
 
   (async () => {
     let sinceLastLongPause = 0;
@@ -489,11 +765,13 @@ async function sendBlast({ recipients, defaultMessage, rateLimit, delayMs }) {
 
     if (job.status !== 'cancelled') job.status = 'completed';
     job.finishedAt = new Date().toISOString();
+    touchActivity();
     // FIFO trim handled by pushJob() (WA_JOBS_MAX_HISTORY)
   })().catch((err) => {
     job.status = 'error';
     job.finishedAt = new Date().toISOString();
     job.error = err.message;
+    touchActivity();
   });
 
   return { jobId: job.id, total: job.total, rateLimit: rl };
@@ -526,6 +804,7 @@ function clearJobs({ all = false } = {}) {
 module.exports = {
   initClient,
   connectFresh,
+  resetSession,
   logout,
   sendBlast,
   cancelJob,
@@ -533,5 +812,6 @@ module.exports = {
   getStatus,
   getJob,
   listJobs,
+  startIdleMonitor,
   DEFAULT_RATE_LIMIT,
 };
